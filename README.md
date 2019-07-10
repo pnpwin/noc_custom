@@ -1,1 +1,1 @@
-# noc_custom
+# Custom repository for [NOC Project](https://getnoc.com)
