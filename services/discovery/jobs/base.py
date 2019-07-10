@@ -3,14 +3,13 @@
 # ---------------------------------------------------------------------
 # Basic MO discovery job
 # ---------------------------------------------------------------------
-# Copyright (C) 2007-2017 The NOC Project
+# Copyright (C) 2007-2018 The NOC Project
 # See LICENSE for details
 # ---------------------------------------------------------------------
 
 # Python modules
 from collections import defaultdict
 import contextlib
-import time
 import zlib
 import datetime
 import types
@@ -41,6 +40,7 @@ from noc.core.span import Span
 from noc.core.error import ERR_UNKNOWN
 from noc.core.cache.base import cache
 from noc.core.perf import metrics
+from noc.core.backport.time import perf_counter
 
 
 class MODiscoveryJob(PeriodicJob):
@@ -100,18 +100,27 @@ class MODiscoveryJob(PeriodicJob):
             }
         }, upsert=True)
 
+    def get_running_policy(self):
+        raise NotImplementedError
+
     def can_run(self):
-        # @todo: Make configurable
-        os = self.object.get_status()
-        if not os:
-            self.logger.info("Object ping Fail, Job will not run")
-        return self.object.is_managed and os
+        # Check object is managed
+        if not self.object.is_managed:
+            self.logger.info("Object is not managed. Skipping job")
+            return False
+        # Check object status according to policy
+        rp = self.get_running_policy()
+        if rp == "R" or (rp == "r" and self.object.object_profile.enable_ping):
+            if not self.object.get_status():
+                self.logger.info("Object is down. Skipping job")
+                return False
+        return True
 
     @contextlib.contextmanager
     def check_timer(self, name):
-        t = time.time()
+        t = perf_counter()
         yield
-        self.check_timings += [(name, time.time() - t)]
+        self.check_timings += [(name, perf_counter() - t)]
 
     def set_problem(self, check=None, alarm_class=None, path=None,
                     message=None, fatal=False):
@@ -135,6 +144,9 @@ class MODiscoveryJob(PeriodicJob):
         }]
         if fatal:
             self.has_fatal_error = True
+
+    def set_fatal_error(self):
+        self.has_fatal_error = True
 
     def get_caps(self):
         """
@@ -231,7 +243,7 @@ class MODiscoveryJob(PeriodicJob):
                 v = d.get("vars", {})
                 v["path"] = d_path
                 clear_notification_group = d.get("clear_notification_group")
-                clear_template = d.get("clear_template")
+                clear_template = d.get('clear_template')
                 da = ActiveAlarm(
                     timestamp=now,
                     managed_object=self.object.id,
@@ -343,13 +355,13 @@ class DiscoveryCheck(object):
     # If not None, check job has all required artefacts
     required_artefacts = None
     #
-    fatal_errors = set([
+    fatal_errors = {
         ERR_CLI_AUTH_FAILED,
         ERR_CLI_NO_SUPER_COMMAND,
         ERR_CLI_LOW_PRIVILEGES,
         ERR_CLI_CONNECTION_REFUSED,
         ERR_CLI_SSH_PROTOCOL_ERROR
-    ])
+    }
     # Error -> Alarm class mappings
     error_map = {
         ERR_CLI_AUTH_FAILED: "Discovery | Error | Auth Failed",
@@ -487,7 +499,8 @@ class DiscoveryCheck(object):
     def handler(self):
         pass
 
-    def update_if_changed(self, obj, values, ignore_empty=None, async=False, bulk=None):
+    def update_if_changed(self, obj, values, ignore_empty=None,
+                          wait=True, bulk=None):
         """
         Update fields if changed.
         :param obj: Document instance
@@ -495,7 +508,7 @@ class DiscoveryCheck(object):
         :param values: New values
         :type values: dict
         :param ignore_empty: List of fields which may be ignored if empty
-        :param async: set write concern to 0
+        :param wait: Wait for operation to complete. set write concern to 0 if False
         :param bulk: Execute as the bulk op instead
         :returns: List of changed (key, value)
         :rtype: list
@@ -505,7 +518,7 @@ class DiscoveryCheck(object):
         for k, v in six.iteritems(values):
             vv = getattr(obj, k)
             if v != vv:
-                if type(v) != int or not hasattr(vv, "id") or v != vv.id:
+                if not isinstance(v, int) or not hasattr(vv, "id") or v != vv.id:
                     if k in ignore_empty and (v is None or v == ""):
                         continue
                     setattr(obj, k, v)
@@ -521,7 +534,7 @@ class DiscoveryCheck(object):
                 }, op)]
             else:
                 kwargs = {}
-                if async:
+                if not wait:
                     kwargs["write_concern"] = {"w": 0}
                 obj.save(**kwargs)
         return changes
@@ -560,16 +573,16 @@ class DiscoveryCheck(object):
         self.logger.debug("Searching port by MAC: %s:%s", mo.name, mac)
         key = (mo, mac)
         if key not in self.if_mac_cache:
-            li = list(Interface.objects.filter(
+            i = Interface.objects.filter(
                 managed_object=mo,
                 mac=mac,
                 type="physical"
-            ))
-            if len(li) == 1:
-                li = li[0]
+            )[:2]
+            if len(i) == 1:
+                i = i[0]
             else:
-                li = None  # Non unique or not found
-            self.if_mac_cache[key] = li
+                i = None  # Non unique or not found
+            self.if_mac_cache[key] = i
         return self.if_mac_cache[key]
 
     def get_interface_by_ip(self, ip, mo=None):
@@ -677,6 +690,38 @@ class DiscoveryCheck(object):
         :return: True, if artefact exists, False otherwise
         """
         return self.job.has_artefact(name)
+
+    def invalidate_neighbor_cache(self, obj=None):
+        """
+        Reset cached neighbors for object.
+
+        NB: May be called by non-topology checks
+        :param obj: Managed Object instance, jobs object if ommited
+        :return:
+        """
+        obj = obj or self.object
+        if not obj.object_profile.neighbor_cache_ttl:
+            # Disabled cache
+            return
+        keys = ["mo-neighbors-%s-%s" % (x, obj.id)
+                for x in obj.segment.profile.get_topology_methods()]
+        if keys:
+            self.logger.info("Invalidating neighor cache: %s" % ", ".join(keys))
+            cache.delete_many(keys, TopologyDiscoveryCheck.NEIGHBOR_CACHE_VERSION)
+
+    def get_confdb(self):
+        # Check cached value
+        if hasattr(self, "confdb"):
+            return self.confdb
+        # Check artefact
+        if self.has_artefact("confdb"):
+            self.confdb = self.get_artefact("confdb")
+            return self.confdb
+        # Create
+        self.logger.info("Building ConfDB")
+        self.confdb = self.object.get_confdb()
+        self.set_artefact("confdb", self.confdb)
+        return self.confdb
 
 
 class TopologyDiscoveryCheck(DiscoveryCheck):
@@ -843,28 +888,6 @@ class TopologyDiscoveryCheck(DiscoveryCheck):
                     path=i,
                     message=problems[i]
                 )
-
-    def cached_iter_neighbors(self, mo):
-        """
-        Apply caching policy to *iter_neighbbors*
-        :param mo:
-        :return: Cached result of iter_neighbors
-        """
-        ttl = mo.object_profile.neighbor_cache_ttl
-        if not ttl:
-            # Disabled cache
-            return list(self.iter_neighbors(mo))
-        # Cached version
-        key = "mo-neighbors-%s-%s" % (self.name, mo.id)
-        neighbors = cache.get(key, version=self.NEIGHBOR_CACHE_VERSION)
-        if neighbors is None:
-            neighbors = list(self.iter_neighbors(mo))
-            cache.set(key, neighbors, ttl=ttl,
-                      version=self.NEIGHBOR_CACHE_VERSION)
-            metrics["neighbor_cache_misses"] += 1
-        else:
-            metrics["neighbor_cache_hits"] += 1
-        return neighbors
 
     def cached_neighbors(self, mo, key, iter_neighbors):
         """
@@ -1358,3 +1381,84 @@ class TopologyDiscoveryCheck(DiscoveryCheck):
     def is_own_mac(self, mac):
         mr = DiscoveryID.macs_for_objects(self.object)
         return mr and any(1 for f, t in mr if f <= mac <= t)
+
+
+class PolicyDiscoveryCheck(DiscoveryCheck):
+    policy_name = None
+    policy_map = {
+        "s": ["script"],
+        "S": ["script", "confdb"],
+        "C": ["confdb", "script"],
+        "c": ["confdb"]
+    }
+
+    def get_policy(self):
+        """
+        Get effective policy
+        :return:
+        """
+        if self.policy_name:
+            return getattr(self.object, self.policy_name)()
+        raise NotImplementedError
+
+    def get_data(self):
+        """
+        Request data according to policy (Either from equipment of from ConfDB)
+        :return:
+        """
+        for method in self.policy_map[self.get_policy()]:
+            check = getattr(self, "can_get_data_from_%s" % method)
+            if not check():
+                continue
+            getter = getattr(self, "request_data_from_%s" % method)
+            data = getter()
+            if data is not None:
+                return data
+        return None
+
+    def request_data_from_script(self):
+        self.logger.info("Requesting data from device")
+        return self.get_data_from_script()
+
+    def get_data_from_script(self):
+        """
+        Actually get data from script. Should be overriden
+        :return:
+        """
+        return None
+
+    def can_get_data_from_script(self):
+        """
+        Check if object has all prerequisites to get data from script
+        :return:
+        """
+        if self.required_script not in self.object.scripts:
+            self.logger.info("%s script is not supported. Skipping", self.required_script)
+            return False
+        return True
+
+    def request_data_from_confdb(self):
+        # self.confdb is set by can_get_data_from_confdb
+        return self.get_data_from_confdb()
+
+    def get_data_from_confdb(self):
+        """
+        Actually get data from ConfDB. Should be overriden
+        :return:
+        """
+        return None
+
+    def can_get_data_from_confdb(self):
+        """
+        Check if object has all prerequisites to get data from ConfDB
+        :return:
+        """
+        confdb = self.get_confdb()
+        if confdb is None:
+            self.logger.error("confdb artefact is not set. Skipping")
+            return False
+        return True
+
+    def has_required_script(self):
+        return (super(PolicyDiscoveryCheck, self).has_required_script() or
+                self.get_policy() != ["script"])
