@@ -244,6 +244,7 @@ class MODiscoveryJob(PeriodicJob):
                 v["path"] = d_path
                 clear_notification_group = d.get("clear_notification_group")
                 clear_template = d.get('clear_template')
+                log = d.get('log')
                 da = ActiveAlarm(
                     timestamp=now,
                     managed_object=self.object.id,
@@ -252,7 +253,8 @@ class MODiscoveryJob(PeriodicJob):
                     vars=v,
                     root=umbrella.id,
                     clear_notification_group=clear_notification_group,
-                    clear_template=clear_template
+                    clear_template=clear_template,
+                    log=log
                 )
                 da.save()
                 self.logger.info("Opening detail alarm %s %s (%s)",
