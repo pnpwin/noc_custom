@@ -62,7 +62,7 @@ def handler(mo, alarm):
             alarm['vars']["description"] = str(iface.description)
             alarm['vars']['threshold_interval'] = int(threshold_interval) / 60
             alarm['vars']['ts_from_date'] = str(int(ts_from_date * 1000))
-            alarm['vars']['mo'] = mo.object.name.replace("#", "%2F")
+            alarm['vars']['mo'] = mo.object.name.replace("#", "%2F").replace(" ", "%20")
             if "Load" in alarm['vars']['metric']:
                 if iface.in_speed and iface.out_speed:
                     if "In" in alarm['vars']['metric']:
@@ -76,11 +76,11 @@ def handler(mo, alarm):
             if "Errors" in alarm['vars']['metric']:
                 alarm['vars']['current_value'] = alarm['vars']['value'] * (threshold_interval * 300.0)
             if mo.object.can_notify():
+                alarm["managed_object"] = {"name": mo.object.name,
+                                           "bi_id": mo.object.bi_id,
+                                           "id": mo.object.id}
                 ctx = {
-                    "alarm": alarm,
-                    "managed_object": {"name": mo.object.name,
-                                       "bi_id": mo.object.bi_id,
-                                       "id": mo.object.id}
+                    "alarm": alarm
                 }
                 esc = alarm_escalation(alarm, mo, ctx)
                 if esc:
