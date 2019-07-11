@@ -79,7 +79,8 @@ def handler(mo, alarm):
                 ctx = {
                     "alarm": alarm,
                     "managed_object": {"name": mo.object.name,
-                                       "bi_id": mo.object.bi_id}
+                                       "bi_id": mo.object.bi_id,
+                                       "id": mo.object.id}
                 }
                 esc = alarm_escalation(alarm, mo, ctx)
                 if esc:
