@@ -17,6 +17,7 @@ from noc.fm.models.alarmescalation import AlarmEscalation
 from noc.sa.models.selectorcache import SelectorCache
 from noc.sa.models.managedobject import ManagedObject
 from noc.fm.models.alarmlog import AlarmLog
+from noc.fm.models.activealarm import ActiveAlarm
 
 from noc.core.defer import call_later
 
@@ -57,19 +58,23 @@ def handler(mo, alarm):
     iface = Interface.objects.get(name=alarm["vars"]["path"].split("|")[-1::][0].strip(), managed_object=mo.object)
     try:
         if iface:
-            if iface.in_speed and iface.out_speed:
-                if "In" in alarm['vars']['metric']:
-                    iface_speed = iface.in_speed
-                else:
-                    iface_speed = iface.out_speed
-                alarm['vars']['percent'] = round((100.0 / int(iface_speed)) * ((alarm['vars']['value']) / 1000))
-
             alarm['vars']["interface"] = alarm["vars"]["path"].split("|")[-1::][0].strip()
             alarm['vars']["description"] = str(iface.description)
-            alarm['vars']['convert_value'] = humanize_speed(alarm['vars']['value'], metric.measure)
             alarm['vars']['threshold_interval'] = int(threshold_interval) / 60
             alarm['vars']['ts_from_date'] = str(int(ts_from_date * 1000))
             alarm['vars']['mo'] = mo.object.name.replace("#", "%2F")
+            if "Load" in alarm['vars']['metric']:
+                if iface.in_speed and iface.out_speed:
+                    if "In" in alarm['vars']['metric']:
+                        iface_speed = iface.in_speed
+                    else:
+                        iface_speed = iface.out_speed
+                    alarm['vars']['percent'] = round((100.0 / int(iface_speed)) * ((alarm['vars']['value']) / 1000))
+                alarm['vars']['convert_value'] = humanize_speed(alarm['vars']['value'], metric.measure)
+            if "Status" in alarm['vars']['metric']:
+                alarm['vars']['link'] = iface.link()
+            if "Errors" in alarm['vars']['metric']:
+                alarm['vars']['current_value'] = alarm['vars']['value'] * (threshold_interval * 300.0)
             if mo.object.can_notify():
                 ctx = {
                     "alarm": alarm,
@@ -115,9 +120,14 @@ def alarm_escalation(alarm, mo, ctx):
             else:
                 delay = None
             if e_item.notification_group:
+                a = ActiveAlarm.objects.filter(managed_object=mo.object, vars__path=alarm['vars']["path"]).first()
+                if a:
+                    logger.info("Alarm already sending")
+                    break
                 subject = e_item.template.render_subject(**ctx)
                 body = e_item.template.render_body(**ctx)
                 logger.debug("Notification message:\nSubject: %s\n%s", subject, body)
+
                 call_later(
                     "noc.custom.handlers.thresholds.thresholdsnotification.threshold_escalation",
                     delay=delay,
